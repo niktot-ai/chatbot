@@ -241,6 +241,91 @@ async def get_all_fields(user_query):
     print(parsed_json)
     return parsed_json
 
+def get_time_horizon(years):
+    if years <= 4:
+        return 'short'
+    elif years <= 10:
+        return 'medium'
+    else:
+        return 'long'
+
+def get_allocation_percentage(risk_profile, time_horizon):
+    matrix = {
+        "aggressive": {"long": {"equity": 80, "hybrid": 10, "debt": 10},
+                       "medium": {"equity": 60, "hybrid": 20, "debt": 20},
+                       "short": {"equity": 30, "hybrid": 30, "debt": 40}},
+        "moderate": {"long": {"equity": 80, "hybrid": 10, "debt": 10},
+                     "medium": {"equity": 40, "hybrid": 20, "debt": 40},
+                     "short": {"equity": 20, "hybrid": 40, "debt": 40}},
+        "conservative": {"long": {"equity": 40, "hybrid": 30, "debt": 30},
+                         "medium": {"equity": 20, "hybrid": 30, "debt": 50},
+                         "short": {"equity": 10, "hybrid": 30, "debt": 60}}
+    }
+    return matrix[risk_profile][time_horizon]
+
+def get_return_column(transaction_type, number_of_years):
+    if number_of_years < 2:
+        return 'OneYearReturns' if transaction_type == 'lumpsum' else 'SYRET1'
+    elif number_of_years <= 4:
+        return 'ThreeYearReturns' if transaction_type == 'lumpsum' else 'SYRET3'
+    else:
+        return 'FiveYearReturns' if transaction_type == 'lumpsum' else 'SYRET5'
+
+def filter_funds(equity, debt, hybrid, allocation, number_of_years):
+    if number_of_years <= 4:
+        equity = equity[~equity['Category'].isin(['Mid Cap', 'Small Cap'])]
+
+    if allocation.get('hybrid', 0) == 20:
+        hybrid = hybrid[hybrid['Category'].isin(['Dynamic Asset Allocation', 'Multi Asset Allocation'])]
+
+    debt = debt[debt['Category'].isin([
+        'Corporate Bond', 'Short Duration', 'Banking and PSU', 'Liquid/Overnight'
+    ])]
+
+    return equity, debt, hybrid
+
+def get_top_funds(equity, debt, hybrid):
+    return (
+        equity.groupby('Category').head(1),
+        debt.groupby('Category').head(1),
+        hybrid.groupby('Category').head(1)
+    )
+
+@cl.step(type="tool")
+async def recommend_funds(fields):
+    transaction_type = fields['transaction_type']
+    number_of_years = fields['number_of_years']
+
+    if transaction_type == 'sip' and fields['monthly_sip']:
+        amount = fields['monthly_sip']
+    else:
+        amount = fields['investment_amount']
+    risk_profile = fields['risk_profile']
+
+    time_horizon = get_time_horizon(number_of_years)
+    allocation = get_allocation_percentage(risk_profile, time_horizon)
+    allocated_amount = {category: (percentage / 100) * amount for category, percentage in allocation.items()}
+    print("this is from allocated amount:", allocated_amount)
+    return_column = get_return_column(transaction_type, number_of_years)
+
+    equity = data[data['Nature'] == 'Equity'].sort_values(by=return_column, ascending=False)
+    hybrid = data[data['Nature'] == 'Hybrid'].sort_values(by=return_column, ascending=False)
+    debt = data[data['Nature'] == 'Debt'].sort_values(by=return_column, ascending=False)
+
+    equity, debt, hybrid = filter_funds(equity, debt, hybrid, allocation, number_of_years)
+
+    equity, debt, hybrid = get_top_funds(equity, debt, hybrid)
+    
+    equity = equity.to_csv(index=False)
+    debt = debt.to_csv(index=False)
+    hybrid = hybrid.to_csv(index=False)
+    
+    print("equity funds:", equity)
+    print("debt funds", debt)
+    print("hybrid funds", hybrid)
+    
+    return call_ai_for_recommendation(equity, debt, hybrid, allocation, allocated_amount, transaction_type, number_of_years, time_horizon)
+
 @cl.on_message
 async def main(message: cl.Message):
     user_query = message.content.strip().lower()
@@ -260,3 +345,7 @@ async def main(message: cl.Message):
     print("chat_history", chat_history)
     fields = await get_all_fields(user_query)
     print("all the fields",fields)
+    
+    print("chat_history", chat_history)
+    result = await recommend_funds(fields)
+    await cl.Message(content=result).send()
