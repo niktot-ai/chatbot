@@ -291,6 +291,157 @@ def get_top_funds(equity, debt, hybrid):
         hybrid.groupby('Category').head(1)
     )
 
+def call_ai_for_recommendation(equity, debt, hybrid, allocation, allocated_amount, transaction_type, number_of_years, time_horizon):
+    client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=os.environ.get("GROQ_API_KEY"))
+    
+    prompt = f"""
+    # MUTUAL FUND RECOMMENDATION SYSTEM
+
+## CORE REQUIREMENTS
+- Recommend ONLY funds from the provided 'mutual_funds equity, debt and hybrid data'
+
+## FUND SELECTION RULES
+### Portfolio Constraints:
+- Maximum 4 equity subnatures
+- Maximum 2 schemes per AMC (Asset management company)  
+- One scheme per subnature
+- NO Small Cap/Mid Cap for short-term goals
+- NO ELSS unless explicitly requested
+- Prioritize diversification and AMC rotation
+
+### Subnature Guidelines:
+- **Equity**: Prefer Multi Cap for moderate+ profiles with long-term goals
+- **Hybrid (≥20%)**: Split between Balanced Advantage Fund (BAF) and Multi Asset
+- **Debt**: Use Corporate Bond, Short Duration, Banking & PSU, Liquid based on horizon
+
+### SIP Constraints (if applicable):
+- Minimum ₹1,000 per scheme
+- Must comply with fund's SIPMinAmt and SIPMaxAmt
+- Increments must follow StepUpMulAmt
+
+### Minimum SIP Requirements:
+SIP Allocation Matrix
+**Apply ONLY when SIP is specifically requested:**
+
+**Conservative Risk:**
+- Short-term: Min ₹3,000 SIP, 3 funds
+- Medium-term: Min ₹4,000 SIP, 4 funds
+- Long-term: Min ₹5,000 SIP, 5 funds
+
+**Moderate Risk:**
+- Short-term: Min ₹4,000 SIP, 4 funds
+- Medium-term: Min ₹5,000 SIP, 5 funds
+- Long-term: Min ₹6,000 SIP, 6 funds
+
+**Aggressive Risk:**
+- Short-term: Min ₹4,000 SIP, 4 funds
+- Medium-term: Min ₹5,000 SIP, 5 funds
+- Long-term: Min ₹6,000 SIP, 6 funds
+
+**Matrix Rules:**
+- These are minimums - scale up if goal requires more
+- If user's amount is below minimum, explain insufficiency and suggest adjustments
+- Maintain fund count consistency with guidelines
+
+
+## AMOUNT VALIDATION
+### Lumpsum Rules:
+- All amounts must be multiples of fund's `MultipleInvestment`
+- Formula: `round(calculated_amount / MultipleInvestment) * MultipleInvestment`
+
+### SIP Rules:
+- Amount must be within SIPMinAmt to SIPMaxAmt range
+- Must be multiples of StepUpMulAmt
+- Formula: `max(SIPMinAmt, round(calculated_sip / StepUpMulAmt) * StepUpMulAmt)`
+
+## DATA SCHEMA REFERENCE
+**Key Fields:**
+- `Encrypt_SchemeCode`: Unique fund ID
+- `SchemeName`: Full fund name
+- `Nature`: Equity/Debt/Hybrid
+- `MinimumInvestment`, `MultipleInvestment`: Lumpsum constraints
+- `SIPMinAmt`, `SIPMaxAmt`, `StepUpMulAmt`: SIP constraints
+- `OneYearReturns`, `ThreeYearReturns`, `FiveYearReturns`: Lumpsum returns
+- `SYRET1`, `SYRET3`, `SYRET5`: SIP returns
+
+## CRITICAL RULES
+1. **Cumulative Investment**: Add new investments to existing ones (never replace)
+2. **Mathematical Accuracy**: All allocations must sum to exactly ₹total_investment:, (100%)
+3. **Compliance First**: Adjust amounts to meet fund constraints, then rebalance proportionally
+
+
+## RESPONSE FORMAT
+Respond in this exact JSON structure and use appropriate fields and only give the json response:
+
+{{
+  "goal_oriented": true/false,
+  "goal_name": "<goal_name_if_applicable>",
+  "transaction_type": "{transaction_type}",
+  "time_horizon": "{time_horizon}",
+  "number_of_years": {number_of_years},
+  "allocation": {{
+    "equity": {allocation['equity']},
+    "hybrid": {allocation['hybrid']}, 
+    "debt": {allocation['debt']}
+  }},
+  "mutual_fund_recommendations": [
+    {{
+      "scheme_no": <serial_number>,
+      "scheme_name": "<exact_fund_name_from_data>",
+      "asset_class": "<equity/hybrid/debt>",
+      "allocation_percent": <percent>,
+      "allocation_amount": <compliant_amount>,
+      "Encrypt_SchemeCode": "<scheme_code>",
+      "Category": "<category>",
+      "Nature": "<nature>",
+      "MinimumInvestment": <min_investment>,
+      "MultipleInvestment": <multiple_investment>,
+      "SIPMinAmt": <sip_min>,
+      "SIPMaxAmt": <sip_max>,
+      "StepUpMulAmt": <step_up_multiple>,
+      "OneYearReturns": <returns>,
+      "ThreeYearReturns": <returns>,
+      "FiveYearReturns": <returns>,
+      "SYRET1": <sip_returns>,
+      "SYRET3": <sip_returns>,
+      "SYRET5": <sip_returns>,
+      "rationale": "<selection_reason>",
+      "amount_adjustment": "<compliance_adjustments>"
+    }}
+  ],
+  "validation_summary": {{
+    "total_allocated": <sum_of_allocations>,
+    "compliance_check": "<validation_status>",
+    "adjustments_made": "<summary_of_changes>"
+  }}
+}}
+allocation amount: {allocated_amount}
+allocation percentage: {allocation}
+
+equity funds: 
+{equity}
+
+ debt funds: 
+{debt}
+
+ hybrid funds: 
+{hybrid}
+
+    """
+    
+    print("this is from prompt:", prompt)
+    response = client.chat.completions.create(
+        model= "meta-llama/llama-4-scout-17b-16e-instruct",
+        # model = "deepseek-r1-distill-llama-70b",
+        messages= [
+                {"role": "system", "content": prompt}
+        ],
+        temperature=0.1,
+    )
+    
+    extracted_json = response.choices[0].message.content.strip()
+    return extracted_json
+
 @cl.step(type="tool")
 async def recommend_funds(fields):
     transaction_type = fields['transaction_type']
