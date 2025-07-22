@@ -6,6 +6,8 @@ import json
 import pandas as pd
 import chainlit as cl
 
+from chainlit import CustomElement
+
 load_dotenv()
 
 client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=os.environ.get("GROQ_API_KEY"))
@@ -499,4 +501,38 @@ async def main(message: cl.Message):
     
     print("chat_history", chat_history)
     result = await recommend_funds(fields)
-    await cl.Message(content=result).send()
+
+    match = re.search(r"```json(.*?)```", result, re.DOTALL)
+    if match:
+        json_str = match.group(1).strip()
+    else:
+        json_str = result.strip()
+        
+    try:
+        ans_json = json.loads(json_str)
+        print("ans_json", ans_json)
+        
+        grouped = {"equity": [], "hybrid": [], "debt": []}
+        for scheme in ans_json["mutual_fund_recommendations"]:
+            asset_class = scheme["asset_class"].lower()
+            if asset_class in grouped:
+                grouped[asset_class].append(scheme)
+            else:
+                print(f"Unknown asset_class in scheme: {scheme['asset_class']}")
+
+        element = CustomElement(name="FundRecommendation", props=grouped)
+        print("element:", element)
+        await cl.Message(content="📊 Here are your recommended funds:", elements=[element]).send()
+        
+        summary = ans_json["validation_summary"]
+        await cl.Message(
+            content=f""" **Validation Summary**
+        - Total Allocated: ₹{summary['total_allocated']}
+        - Compliance: {summary['compliance_check']}
+        - Adjustments: {summary['adjustments_made']}
+        """
+        ).send()
+        
+    except json.JSONDecodeError as e:
+        print("Invalid JSON:", e)
+        await cl.Message(content=result).send()
