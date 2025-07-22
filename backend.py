@@ -1,69 +1,105 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, Any, List
+import uuid
+import json
+import re
+import pandas as pd
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
-import re
-import json
-import pandas as pd
-import chainlit as cl
-
-from chainlit import CustomElement
 
 load_dotenv()
 
+app = FastAPI(title="Mutual Fund Chatbot API", version="1.0.0")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure this based on your frontend domain
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize OpenAI client
 client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=os.environ.get("GROQ_API_KEY"))
 
-chat_history = [
-    {'role': 'system', 'content': "You are a helpful assistant."}
-]
-
+# Load data
 data = pd.read_csv('data.csv')
 
-async def handle_general_query(user_query):
-    general_prompt = """
-    You are a friendly, knowledgeable, and polite finance chatbot assistant. Your primary role is to assist users with finance-related questions—especially mutual fund recommendations based on their investment goals, risk appetite, and time horizon.
+# In-memory storage for chat sessions (use Redis or database in production)
+chat_sessions: Dict[str, List[Dict[str, str]]] = {}
 
-    Respond clearly, concisely, and respectfully to all queries. Do not answer to general question, ask user for help about personalized fund recommendation. 
+# Pydantic models for request/response
+class ChatRequest(BaseModel):
+    session_id: Optional[str] = None
+    message: str
 
-    If the user asks something unrelated to finance, respond politely and gently redirect them back to your area of expertise. You can say something like:
-    "I'm here to help with financial topics—especially mutual fund recommendations and investment-related questions. If you’d like assistance with your investments, feel free to share your goals or risk profile!"
+class ChatResponse(BaseModel):
+    session_id: str
+    response: Any  # Can be string (followup question) or dict (recommendations)
+    response_type: str  # "followup_question" or "recommendations" or "general_response"
 
-    Always keep a warm, approachable tone and guide users toward making informed financial decisions.
-    """
-    response = client.chat.completions.create(
-        model="moonshotai/kimi-k2-instruct",
-        messages= chat_history + [
-            {"role": "system", "content": general_prompt},
-            {"role": "user", "content": user_query}
-        ],
-        temperature=0.7
+class SessionResponse(BaseModel):
+    session_id: str
+    message: str
+
+# Helper functions (keeping your existing logic)
+def get_time_horizon(years):
+    if years <= 4:
+        return 'short'
+    elif years <= 10:
+        return 'medium'
+    else:
+        return 'long'
+
+def get_allocation_percentage(risk_profile, time_horizon):
+    matrix = {
+        "aggressive": {"long": {"equity": 80, "hybrid": 10, "debt": 10},
+                       "medium": {"equity": 60, "hybrid": 20, "debt": 20},
+                       "short": {"equity": 30, "hybrid": 30, "debt": 40}},
+        "moderate": {"long": {"equity": 80, "hybrid": 10, "debt": 10},
+                     "medium": {"equity": 40, "hybrid": 20, "debt": 40},
+                     "short": {"equity": 20, "hybrid": 40, "debt": 40}},
+        "conservative": {"long": {"equity": 40, "hybrid": 30, "debt": 30},
+                         "medium": {"equity": 20, "hybrid": 30, "debt": 50},
+                         "short": {"equity": 10, "hybrid": 30, "debt": 60}}
+    }
+    return matrix[risk_profile][time_horizon]
+
+def get_return_column(transaction_type, number_of_years):
+    if number_of_years < 2:
+        return 'OneYearReturns' if transaction_type == 'lumpsum' else 'SYRET1'
+    elif number_of_years <= 4:
+        return 'ThreeYearReturns' if transaction_type == 'lumpsum' else 'SYRET3'
+    else:
+        return 'FiveYearReturns' if transaction_type == 'lumpsum' else 'SYRET5'
+
+def filter_funds(equity, debt, hybrid, allocation, number_of_years):
+    if number_of_years <= 4:
+        equity = equity[~equity['Category'].isin(['Mid Cap', 'Small Cap'])]
+
+    if allocation.get('hybrid', 0) == 20:
+        hybrid = hybrid[hybrid['Category'].isin(['Dynamic Asset Allocation', 'Multi Asset Allocation'])]
+
+    debt = debt[debt['Category'].isin([
+        'Corporate Bond', 'Short Duration', 'Banking and PSU', 'Liquid/Overnight'
+    ])]
+
+    return equity, debt, hybrid
+
+def get_top_funds(equity, debt, hybrid):
+    return (
+        equity.groupby('Category').head(1),
+        debt.groupby('Category').head(1),
+        hybrid.groupby('Category').head(1)
     )
-    return response.choices[0].message.content.strip()
 
-@cl.step(type="tool")
-async def classify_user_query(user_query):
-    routing_prompt = """
-    You are a smart assistant that classifies user queries for a finance chatbot.
-
-    Based on the user message, classify it as one of the following:
-    - "investment_query" → if the user is providing or intending to provide financial details for investment, such as amount, goal, risk, duration, SIP/lumpsum, etc.
-    - "general_query" → if the user is asking general questions, greetings, or anything not related to providing investment input.
-
-    Respond with ONLY one of: "investment_query" or "general_query". Do NOT explain anything.
-    """
-    response = client.chat.completions.create(
-        model="moonshotai/kimi-k2-instruct",
-        messages= chat_history + [
-            {"role": "system", "content": routing_prompt},
-            {"role": "user", "content": user_query}
-        ],
-        temperature=0
-    )
-    return response.choices[0].message.content.strip().strip('"').lower()
-
-@cl.step(type="tool")
-async def extract_fields(user_query):
+async def extract_fields(user_query, chat_history):
     FIELD_EXTRACTION_SYSTEM_PROMPT = """
-    You are an intelligent assistant that extracts structured investment information from user messages and performs all necessary calculations.
+        You are an intelligent assistant that extracts structured investment information from user messages and performs all necessary calculations.
 
     Extract the following fields and perform calculations:
     - transaction_type: "lumpsum" or "sip" 
@@ -146,10 +182,9 @@ async def extract_fields(user_query):
     "monthly_sip": null
     }
     """
-    
     response = client.chat.completions.create(
-        model = "moonshotai/kimi-k2-instruct",
-        messages= chat_history + [
+        model="moonshotai/kimi-k2-instruct",
+        messages=chat_history + [
             {"role": "system", "content": FIELD_EXTRACTION_SYSTEM_PROMPT},
             {"role": "user", "content": user_query}
         ],
@@ -157,25 +192,65 @@ async def extract_fields(user_query):
     )
     content = response.choices[0].message.content.strip()
     
-    cleaned_content = re.sub(r'<think>[\s\S]*?<\/think>', '', content)  
-    print(cleaned_content)
+    cleaned_content = re.sub(r'<think>[\s\S]*?</think>', '', content)
     match = re.search(r'({[\s\S]*?})', cleaned_content)
     if match:
         json_str = match.group(1)
     else:
         json_str = cleaned_content
+    
     try:
         parsed_json = json.loads(json_str)
     except Exception as e:
         print("Failed to parse LLM output:", content)
         raise e
-    print("parsed_json", parsed_json)
+    
     return parsed_json
 
-@cl.step(type="tool")
-async def generate_followup_question(fields):
+async def handle_general_query(user_query, chat_history):
+    general_prompt = """
+    You are a friendly, knowledgeable, and polite finance chatbot assistant. Your primary role is to assist users with finance-related questions—especially mutual fund recommendations based on their investment goals, risk appetite, and time horizon.
+
+    Respond clearly, concisely, and respectfully to all queries. Do not answer to general question, ask user for help about personalized fund recommendation. 
+
+    If the user asks something unrelated to finance, respond politely and gently redirect them back to your area of expertise. You can say something like:
+    "I'm here to help with financial topics—especially mutual fund recommendations and investment-related questions. If you'd like assistance with your investments, feel free to share your goals or risk profile!"
+
+    Always keep a warm, approachable tone and guide users toward making informed financial decisions.
+    """
+    response = client.chat.completions.create(
+        model="moonshotai/kimi-k2-instruct",
+        messages=chat_history + [
+            {"role": "system", "content": general_prompt},
+            {"role": "user", "content": user_query}
+        ],
+        temperature=0.7
+    )
+    return response.choices[0].message.content.strip()
+
+async def classify_user_query(user_query, chat_history):
+    routing_prompt = """
+    You are a smart assistant that classifies user queries for a finance chatbot.
+
+    Based on the user message, classify it as one of the following:
+    - "investment_query" → if the user is providing or intending to provide financial details for investment, such as amount, goal, risk, duration, SIP/lumpsum, etc.
+    - "general_query" → if the user is asking general questions, greetings, or anything not related to providing investment input.
+
+    Respond with ONLY one of: "investment_query" or "general_query". Do NOT explain anything.
+    """
+    response = client.chat.completions.create(
+        model="moonshotai/kimi-k2-instruct",
+        messages=chat_history + [
+            {"role": "system", "content": routing_prompt},
+            {"role": "user", "content": user_query}
+        ],
+        temperature=0
+    )
+    return response.choices[0].message.content.strip().strip('"').lower()
+
+async def generate_followup_question(fields, chat_history):
     prompt = f"""
-        You are a smart and polite assistant. Based on the available fields, either return a follow-up question OR return the existing field values AS-IS.
+    You are a smart and polite assistant. Based on the available fields, either return a follow-up question OR return the existing field values AS-IS.
     You MUST detect the user's language based on the message content and respond in the same language if possible.
     
     CRITICAL RULES:
@@ -213,89 +288,33 @@ async def generate_followup_question(fields):
     """
 
     response = client.chat.completions.create(
-        model = "deepseek-r1-distill-llama-70b",
-        messages= [
+        model="deepseek-r1-distill-llama-70b",
+        messages=[
             {"role": "system", "content": prompt}
         ],
-        temperature=0
+        temperature=0.1
     )
-    content =  response.choices[0].message.content.strip()
+    content = response.choices[0].message.content.strip()
     cleaned_content = re.sub(r'<think>[\s\S]*?<\/think>', '', content)
     return cleaned_content
 
-
-async def get_all_fields(user_query):
-    fields = await extract_fields(user_query)
-    followup_question = await generate_followup_question(fields)   
+async def get_all_fields(user_query, chat_history):
+    fields = await extract_fields(user_query, chat_history)
+    followup_question = await generate_followup_question(fields, chat_history)
+    
     match = re.search(r'({[\s\S]*?})', followup_question)
     if match:
         json_str = match.group(1)
+        try:
+            parsed_json = json.loads(json_str)
+            return {"type": "complete", "data": parsed_json}
+        except Exception as e:
+            print("Failed to parse LLM output:", json_str)
+            return {"type": "followup", "data": followup_question}
     else:
-        json_str = followup_question
-        chat_history.append({"role": "assistant", "content":json_str})
-        await cl.Message(content=json_str).send()
-    try:
-        parsed_json = json.loads(json_str)
-    except Exception as e:
-        print("Failed to parse LLM output:", json_str)
-        raise e
-    print("json string:", json_str)    
-    print(parsed_json)
-    return parsed_json
+        return {"type": "followup", "data": followup_question}
 
-def get_time_horizon(years):
-    if years <= 4:
-        return 'short'
-    elif years <= 10:
-        return 'medium'
-    else:
-        return 'long'
-
-def get_allocation_percentage(risk_profile, time_horizon):
-    matrix = {
-        "aggressive": {"long": {"equity": 80, "hybrid": 10, "debt": 10},
-                       "medium": {"equity": 60, "hybrid": 20, "debt": 20},
-                       "short": {"equity": 30, "hybrid": 30, "debt": 40}},
-        "moderate": {"long": {"equity": 80, "hybrid": 10, "debt": 10},
-                     "medium": {"equity": 40, "hybrid": 20, "debt": 40},
-                     "short": {"equity": 20, "hybrid": 40, "debt": 40}},
-        "conservative": {"long": {"equity": 40, "hybrid": 30, "debt": 30},
-                         "medium": {"equity": 20, "hybrid": 30, "debt": 50},
-                         "short": {"equity": 10, "hybrid": 30, "debt": 60}}
-    }
-    return matrix[risk_profile][time_horizon]
-
-def get_return_column(transaction_type, number_of_years):
-    if number_of_years < 2:
-        return 'OneYearReturns' if transaction_type == 'lumpsum' else 'SYRET1'
-    elif number_of_years <= 4:
-        return 'ThreeYearReturns' if transaction_type == 'lumpsum' else 'SYRET3'
-    else:
-        return 'FiveYearReturns' if transaction_type == 'lumpsum' else 'SYRET5'
-
-def filter_funds(equity, debt, hybrid, allocation, number_of_years):
-    if number_of_years <= 4:
-        equity = equity[~equity['Category'].isin(['Mid Cap', 'Small Cap'])]
-
-    if allocation.get('hybrid', 0) == 20:
-        hybrid = hybrid[hybrid['Category'].isin(['Dynamic Asset Allocation', 'Multi Asset Allocation'])]
-
-    debt = debt[debt['Category'].isin([
-        'Corporate Bond', 'Short Duration', 'Banking and PSU', 'Liquid/Overnight'
-    ])]
-
-    return equity, debt, hybrid
-
-def get_top_funds(equity, debt, hybrid):
-    return (
-        equity.groupby('Category').head(1),
-        debt.groupby('Category').head(1),
-        hybrid.groupby('Category').head(1)
-    )
-
-def call_ai_for_recommendation(equity, debt, hybrid, allocation, allocated_amount, transaction_type, number_of_years, time_horizon):
-    client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=os.environ.get("GROQ_API_KEY"))
-    
+def call_ai_for_recommendation(equity, debt, hybrid, allocation, allocated_amount, transaction_type, number_of_years, time_horizon, chat_history):
     prompt = f"""
     # MUTUAL FUND RECOMMENDATION SYSTEM
 
@@ -345,7 +364,6 @@ SIP Allocation Matrix
 - If user's amount is below minimum, explain insufficiency and suggest adjustments
 - Maintain fund count consistency with guidelines
 
-
 ## AMOUNT VALIDATION
 ### Lumpsum Rules:
 - All amounts must be multiples of fund's `MultipleInvestment`
@@ -370,7 +388,6 @@ SIP Allocation Matrix
 1. **Cumulative Investment**: Add new investments to existing ones (never replace)
 2. **Mathematical Accuracy**: All allocations must sum to exactly ₹total_investment:, (100%)
 3. **Compliance First**: Adjust amounts to meet fund constraints, then rebalance proportionally
-
 
 ## RESPONSE FORMAT
 Respond in this exact JSON structure and use appropriate fields and only give the json response:
@@ -423,20 +440,16 @@ allocation percentage: {allocation}
 equity funds: 
 {equity}
 
- debt funds: 
+debt funds: 
 {debt}
 
- hybrid funds: 
+hybrid funds: 
 {hybrid}
-
     """
-    
-    print("this is from prompt:", prompt)
     response = client.chat.completions.create(
-        model= "meta-llama/llama-4-scout-17b-16e-instruct",
-        # model = "deepseek-r1-distill-llama-70b",
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
         messages= [
-                {"role": "system", "content": prompt}
+            {"role": "system", "content": prompt}
         ],
         temperature=0.1,
     )
@@ -444,21 +457,21 @@ equity funds:
     extracted_json = response.choices[0].message.content.strip()
     return extracted_json
 
-@cl.step(type="tool")
-async def recommend_funds(fields):
+async def recommend_funds(fields, chat_history):
     transaction_type = fields['transaction_type']
     number_of_years = fields['number_of_years']
-
-    if transaction_type == 'sip' and fields['monthly_sip']:
+    
+    if transaction_type == 'sip' and fields.get('monthly_sip'):
         amount = fields['monthly_sip']
     else:
         amount = fields['investment_amount']
+    
     risk_profile = fields['risk_profile']
 
     time_horizon = get_time_horizon(number_of_years)
     allocation = get_allocation_percentage(risk_profile, time_horizon)
     allocated_amount = {category: (percentage / 100) * amount for category, percentage in allocation.items()}
-    print("this is from allocated amount:", allocated_amount)
+
     return_column = get_return_column(transaction_type, number_of_years)
 
     equity = data[data['Nature'] == 'Equity'].sort_values(by=return_column, ascending=False)
@@ -466,73 +479,125 @@ async def recommend_funds(fields):
     debt = data[data['Nature'] == 'Debt'].sort_values(by=return_column, ascending=False)
 
     equity, debt, hybrid = filter_funds(equity, debt, hybrid, allocation, number_of_years)
-
     equity, debt, hybrid = get_top_funds(equity, debt, hybrid)
     
-    equity = equity.to_csv(index=False)
-    debt = debt.to_csv(index=False)
-    hybrid = hybrid.to_csv(index=False)
+    equity_csv = equity.to_csv(index=False)
+    debt_csv = debt.to_csv(index=False)
+    hybrid_csv = hybrid.to_csv(index=False)
     
-    print("equity funds:", equity)
-    print("debt funds", debt)
-    print("hybrid funds", hybrid)
-    
-    return call_ai_for_recommendation(equity, debt, hybrid, allocation, allocated_amount, transaction_type, number_of_years, time_horizon)
+    return call_ai_for_recommendation(equity_csv, debt_csv, hybrid_csv, allocation, allocated_amount, transaction_type, number_of_years, time_horizon, chat_history)
 
-@cl.on_message
-async def main(message: cl.Message):
-    user_query = message.content.strip().lower()
-    print("chat_history", chat_history)
-    
-    classification = await classify_user_query(user_query)
-    classification = re.sub(r'<think>[\s\S]*?<\/think>', '', classification)
-    classification = classification.strip().lower()
+# API Endpoints
+@app.post("/chat/start", response_model=SessionResponse)
+async def start_chat_session():
+    """Start a new chat session"""
+    session_id = str(uuid.uuid4())
+    chat_sessions[session_id] = [
+        {'role': 'system', 'content': "You are a helpful assistant."}
+    ]
+    return SessionResponse(session_id=session_id, message="Chat session started")
 
-    if classification == "general_query":
-        response = await handle_general_query(user_query)   
-        response = re.sub(r'<think>[\s\S]*?<\/think>', '', response)
-        await cl.Message(content=response).send()
-        return
-
-    chat_history.append({"role": "user", "content":user_query})
-    print("chat_history", chat_history)
-    fields = await get_all_fields(user_query)
-    print("all the fields",fields)
-    
-    print("chat_history", chat_history)
-    result = await recommend_funds(fields)
-
-    match = re.search(r"```json(.*?)```", result, re.DOTALL)
-    if match:
-        json_str = match.group(1).strip()
+@app.post("/chat/message", response_model=ChatResponse)
+async def send_message(request: ChatRequest):
+    """Send a message to the chatbot"""
+    # Handle session management
+    if request.session_id and request.session_id in chat_sessions:
+        session_id = request.session_id
     else:
-        json_str = result.strip()
-        
+        session_id = str(uuid.uuid4())
+        chat_sessions[session_id] = [
+            {'role': 'system', 'content': "You are a helpful assistant."}
+        ]
+    
+    chat_history = chat_sessions[session_id]
+    user_query = request.message.strip().lower()
+    
     try:
-        ans_json = json.loads(json_str)
-        print("ans_json", ans_json)
-        
-        grouped = {"equity": [], "hybrid": [], "debt": []}
-        for scheme in ans_json["mutual_fund_recommendations"]:
-            asset_class = scheme["asset_class"].lower()
-            if asset_class in grouped:
-                grouped[asset_class].append(scheme)
-            else:
-                print(f"Unknown asset_class in scheme: {scheme['asset_class']}")
+        # Classify the query
+        classification = await classify_user_query(user_query, chat_history)
+        classification = re.sub(r'<think>[\s\S]*?<\/think>', '', classification)
+        classification = classification.strip().lower()
 
-        element = CustomElement(name="FundRecommendation", props=grouped)
-        print("element:", element)
-        await cl.Message(content="📊 Here are your recommended funds:", elements=[element]).send()
+        # Add user message to history
+        chat_history.append({"role": "user", "content": user_query})
         
-        summary = ans_json["validation_summary"]
-        await cl.Message(
-            content=f""" **Validation Summary**
-        - Total Allocated: ₹{summary['total_allocated']}
-        - Compliance: {summary['compliance_check']}
-        - Adjustments: {summary['adjustments_made']}
-        """
-        ).send()
+        if classification == "general_query":
+            response = await handle_general_query(user_query, chat_history)
+            response = re.sub(r'<think>[\s\S]*?<\/think>', '', response)
+            chat_history.append({"role": "assistant", "content": response})
+            
+            return ChatResponse(
+                session_id=session_id,
+                response=response,
+                response_type="general_response"
+            )
         
-    except json.JSONDecodeError as e:
-        print("Invalid JSON:", e)
-        await cl.Message(content=result).send()
+        # Handle investment query
+        result = await get_all_fields(user_query, chat_history)
+        
+        if result["type"] == "followup":
+            # Return followup question
+            chat_history.append({"role": "assistant", "content": result["data"]})
+            return ChatResponse(
+                session_id=session_id,
+                response=result["data"],
+                response_type="followup_question"
+            )
+        
+        # Generate recommendations
+        fields = result["data"]
+        recommendation_result = await recommend_funds(fields, chat_history)
+        
+        # Parse the recommendation result
+        match = re.search(r"```json(.*?)```", recommendation_result, re.DOTALL)
+        if match:
+            json_str = match.group(1).strip()
+        else:
+            json_str = recommendation_result.strip()
+        
+        try:
+            recommendation_json = json.loads(json_str)
+            chat_history.append({"role": "assistant", "content": json.dumps(recommendation_json)})
+            
+            return ChatResponse(
+                session_id=session_id,
+                response=recommendation_json,
+                response_type="recommendations"
+            )
+        except json.JSONDecodeError:
+            # If JSON parsing fails, return the raw result
+            chat_history.append({"role": "assistant", "content": recommendation_result})
+            return ChatResponse(
+                session_id=session_id,
+                response=recommendation_result,
+                response_type="recommendations"
+            )
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing message: {str(e)}")
+
+@app.get("/chat/history/{session_id}")
+async def get_chat_history(session_id: str):
+    """Get chat history for a session"""
+    if session_id not in chat_sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    return {"session_id": session_id, "history": chat_sessions[session_id]}
+
+@app.delete("/chat/session/{session_id}")
+async def delete_chat_session(session_id: str):
+    """Delete a chat session"""
+    if session_id not in chat_sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    del chat_sessions[session_id]
+    return {"message": "Session deleted successfully"}
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
